@@ -483,6 +483,14 @@ atusb_set_txpower(struct ieee802154_hw *hw, s32 mbm)
 	return -EINVAL;
 }
 
+static int
+atusb_set_lbt(struct ieee802154_hw *hw, bool on)
+{
+    struct atusb *atusb = hw->priv;
+    
+    return atusb_write_subreg(atusb, SR_CSMA_LBT_MODE, on);
+}
+
 #define ATUSB_MAX_ED_LEVELS 0xF
 static const s32 atusb_ed_levels[ATUSB_MAX_ED_LEVELS + 1] = {
 	-9100, -8900, -8700, -8500, -8300, -8100, -7900, -7700, -7500, -7300,
@@ -580,6 +588,14 @@ atusb_set_promiscuous_mode(struct ieee802154_hw *hw, const bool on)
 	return 0;
 }
 
+static int
+atusb_set_frame_retries(struct ieee802154_hw *hw, s8 retries)
+{
+    struct atusb *atusb = hw->priv;
+    
+    return atusb_write_subreg(atusb, SR_MAX_FRAME_RETRIES, retries);
+}
+
 static struct ieee802154_ops atusb_ops = {
 	.owner			= THIS_MODULE,
 	.xmit_async		= atusb_xmit,
@@ -589,9 +605,11 @@ static struct ieee802154_ops atusb_ops = {
 	.stop			= atusb_stop,
 	.set_hw_addr_filt	= atusb_set_hw_addr_filt,
 	.set_txpower		= atusb_set_txpower,
+    .set_lbt = atusb_set_lbt,
 	.set_cca_mode		= atusb_set_cca_mode,
 	.set_cca_ed_level	= atusb_set_cca_ed_level,
 	.set_csma_params	= atusb_set_csma_params,
+    .set_frame_retries = atusb_set_frame_retries,
 	.set_promiscuous_mode	= atusb_set_promiscuous_mode,
 };
 
@@ -648,6 +666,19 @@ static int atusb_get_and_show_build(struct atusb *atusb)
 	return ret;
 }
 
+#define AT86RF212_MAX_TX_POWERS 0x1F
+static const s32 at86rf212_powers[AT86RF212_MAX_TX_POWERS + 1] = {
+    500, 400, 300, 200, 100, 0, -100, -200, -300, -400, -500, -600, -700,
+    -800, -900, -1000, -1100, -1200, -1300, -1400, -1500, -1600, -1700,
+    -1800, -1900, -2000, -2100, -2200, -2300, -2400, -2500, -2600,
+};
+
+#define AT86RF2XX_MAX_ED_LEVELS 0xF
+static const s32 at86rf212_ed_levels_100[AT86RF2XX_MAX_ED_LEVELS + 1] = {
+    -10000, -9800, -9600, -9400, -9200, -9000, -8800, -8600, -8400, -8200,
+    -8000, -7800, -7600, -7400, -7200, -7000,
+};
+
 static int atusb_get_and_show_chip(struct atusb *atusb)
 {
 	struct usb_device *usb_dev = atusb->usb_dev;
@@ -669,13 +700,54 @@ static int atusb_get_and_show_chip(struct atusb *atusb)
 		goto fail;
 	}
 
+    atusb->hw->flags = IEEE802154_HW_TX_OMIT_CKSUM | IEEE802154_HW_AFILT |
+    IEEE802154_HW_PROMISCUOUS | IEEE802154_HW_CSMA_PARAMS;
+    
+    atusb->hw->phy->flags = WPAN_PHY_FLAG_TXPOWER | WPAN_PHY_FLAG_CCA_ED_LEVEL |
+    WPAN_PHY_FLAG_CCA_MODE;
+    
+    atusb->hw->phy->supported.cca_modes = BIT(NL802154_CCA_ENERGY) |
+    BIT(NL802154_CCA_CARRIER) | BIT(NL802154_CCA_ENERGY_CARRIER);
+    atusb->hw->phy->supported.cca_opts = BIT(NL802154_CCA_OPT_ENERGY_CARRIER_AND) |
+    BIT(NL802154_CCA_OPT_ENERGY_CARRIER_OR);
+    
+    atusb->hw->phy->supported.cca_ed_levels = atusb_ed_levels;
+    atusb->hw->phy->supported.cca_ed_levels_size = ARRAY_SIZE(atusb_ed_levels);
+    
+    atusb->hw->phy->cca.mode = NL802154_CCA_ENERGY;
+    
+    atusb->hw->phy->current_page = 0;
+	
 	switch (part_num) {
 	case 2:
 		chip = "AT86RF230";
+        atusb->hw->phy->supported.channels[0] = 0x7FFF800;
+        atusb->hw->phy->current_channel = 11;	/* reset default */
+        atusb->hw->phy->symbol_duration = 16;
+        atusb->hw->phy->supported.tx_powers = atusb_powers;
+        atusb->hw->phy->supported.tx_powers_size = ARRAY_SIZE(atusb_powers);
 		break;
 	case 3:
 		chip = "AT86RF231";
+        atusb->hw->phy->supported.channels[0] = 0x7FFF800;
+        atusb->hw->phy->current_channel = 11;	/* reset default */
+        atusb->hw->phy->symbol_duration = 16;
+        atusb->hw->phy->supported.tx_powers = atusb_powers;
+        atusb->hw->phy->supported.tx_powers_size = ARRAY_SIZE(atusb_powers);
 		break;
+    case 7:
+        chip = "AT86RF212";
+        atusb->hw->flags |= IEEE802154_HW_LBT;
+        atusb->hw->phy->supported.channels[0] = 0x00007FF;
+        atusb->hw->phy->supported.channels[2] = 0x00007FF;
+        atusb->hw->phy->current_channel = 5;
+        atusb->hw->phy->symbol_duration = 25;
+        atusb->hw->phy->supported.lbt = NL802154_SUPPORTED_BOOL_BOTH;
+        atusb->hw->phy->supported.tx_powers = at86rf212_powers;
+        atusb->hw->phy->supported.tx_powers_size = ARRAY_SIZE(at86rf212_powers);
+        atusb->hw->phy->supported.cca_ed_levels = at86rf212_ed_levels_100;
+        atusb->hw->phy->supported.cca_ed_levels_size = ARRAY_SIZE(at86rf212_ed_levels_100);
+        break;
 	default:
 		dev_err(&usb_dev->dev,
 			"unexpected transceiver, part 0x%02x version 0x%02x\n",
@@ -683,8 +755,13 @@ static int atusb_get_and_show_chip(struct atusb *atusb)
 		goto fail;
 	}
 
+	atusb->hw->phy->cca_ed_level = atusb->hw->phy->supported.cca_ed_levels[7];
+    atusb->hw->phy->transmit_power = atusb->hw->phy->supported.tx_powers[0];
+	
 	dev_info(&usb_dev->dev, "ATUSB: %s version %d\n", chip, version_num);
-
+    
+    atusb_command(atusb, ATUSB_RF_RESET, 0);
+    
 	return 0;
 
 fail:
@@ -728,33 +805,9 @@ static int atusb_probe(struct usb_interface *interface,
 	if (!atusb->tx_urb)
 		goto fail;
 
-	hw->parent = &usb_dev->dev;
-	hw->flags = IEEE802154_HW_TX_OMIT_CKSUM | IEEE802154_HW_AFILT |
-		    IEEE802154_HW_PROMISCUOUS | IEEE802154_HW_CSMA_PARAMS;
-
-	hw->phy->flags = WPAN_PHY_FLAG_TXPOWER | WPAN_PHY_FLAG_CCA_ED_LEVEL |
-			 WPAN_PHY_FLAG_CCA_MODE;
-
-	hw->phy->supported.cca_modes = BIT(NL802154_CCA_ENERGY) |
-		BIT(NL802154_CCA_CARRIER) | BIT(NL802154_CCA_ENERGY_CARRIER);
-	hw->phy->supported.cca_opts = BIT(NL802154_CCA_OPT_ENERGY_CARRIER_AND) |
-		BIT(NL802154_CCA_OPT_ENERGY_CARRIER_OR);
-
-	hw->phy->supported.cca_ed_levels = atusb_ed_levels;
-	hw->phy->supported.cca_ed_levels_size = ARRAY_SIZE(atusb_ed_levels);
-
-	hw->phy->cca.mode = NL802154_CCA_ENERGY;
-
-	hw->phy->current_page = 0;
-	hw->phy->current_channel = 11;	/* reset default */
-	hw->phy->supported.channels[0] = 0x7FFF800;
-	hw->phy->supported.tx_powers = atusb_powers;
-	hw->phy->supported.tx_powers_size = ARRAY_SIZE(atusb_powers);
-	hw->phy->transmit_power = hw->phy->supported.tx_powers[0];
-	ieee802154_random_extended_addr(&hw->phy->perm_extended_addr);
-	hw->phy->cca_ed_level = hw->phy->supported.cca_ed_levels[7];
-
-	atusb_command(atusb, ATUSB_RF_RESET, 0);
+    hw->parent = &usb_dev->dev;
+    ieee802154_random_extended_addr(&atusb->hw->phy->perm_extended_addr);
+    
 	atusb_get_and_show_chip(atusb);
 	atusb_get_and_show_revision(atusb);
 	atusb_get_and_show_build(atusb);
