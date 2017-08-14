@@ -48,7 +48,7 @@ enum atusb_requests {
 	ATUSB_TX,
 };
 
-enum atusb_hardwaretype {
+enum atusb_hw_type {
 	ATUSB_HW_TYPE_100813,
 	ATUSB_HW_TYPE_101216,
 	ATUSB_HW_TYPE_110131,

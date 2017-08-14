@@ -42,8 +42,19 @@
 #define ATUSB_ALLOC_DELAY_MS	100	/* delay after failed allocation */
 #define ATUSB_TX_TIMEOUT_MS	200	/* on the air timeout */
 
+struct atusb;
+
+struct atusb_chip_data {
+	u16 t_channel_switch;
+	int rssi_base_val;
+	
+	int (*set_channel)(struct atusb*, u8, u8);
+	int (*set_txpower)(struct atusb*, s32);
+};
+
 struct atusb {
 	struct ieee802154_hw *hw;
+	struct atusb_chip_data *data;
 	struct usb_device *usb_dev;
 	int shutdown;			/* non-zero if shutting down */
 	int err;			/* set by first error */
@@ -58,6 +69,29 @@ struct atusb {
 	struct urb *tx_urb;
 	struct sk_buff *tx_skb;
 	uint8_t tx_ack_seq;		/* current TX ACK sequence number */
+};
+
+#define AT86RF212_MAX_TX_POWERS 0x1F
+static const s32 at86rf212_powers[AT86RF212_MAX_TX_POWERS + 1] = {
+	500, 400, 300, 200, 100, 0, -100, -200, -300, -400, -500, -600, -700,
+	-800, -900, -1000, -1100, -1200, -1300, -1400, -1500, -1600, -1700,
+	-1800, -1900, -2000, -2100, -2200, -2300, -2400, -2500, -2600,
+};
+
+#define ATUSB_MAX_ED_LEVELS 0xF
+static const s32 atusb_ed_levels[ATUSB_MAX_ED_LEVELS + 1] = {
+	-9100, -8900, -8700, -8500, -8300, -8100, -7900, -7700, -7500, -7300,
+	-7100, -6900, -6700, -6500, -6300, -6100,
+};
+
+static const s32 at86rf212_ed_levels_100[ATUSB_MAX_ED_LEVELS + 1] = {
+	-10000, -9800, -9600, -9400, -9200, -9000, -8800, -8600, -8400, -8200,
+	-8000, -7800, -7600, -7400, -7200, -7000,
+};
+
+static const s32 at86rf212_ed_levels_98[ATUSB_MAX_ED_LEVELS + 1] = {
+	-9800, -9600, -9400, -9200, -9000, -8800, -8600, -8400, -8200, -8000,
+	-7800, -7600, -7400, -7200, -7000, -6800,
 };
 
 /* ----- USB commands without data ----------------------------------------- */
@@ -387,16 +421,113 @@ static int atusb_xmit(struct ieee802154_hw *hw, struct sk_buff *skb)
 	return ret;
 }
 
-static int atusb_channel(struct ieee802154_hw *hw, u8 page, u8 channel)
-{
+static int atusb_default_channel(struct ieee802154_hw *hw, u8 page, u8 channel) {
 	struct atusb *atusb = hw->priv;
 	int ret;
+	
+	ret = atusb->data->set_channel(atusb, page, channel);
+	if (ret < 0)
+		return ret;
+	
+	/* Wait for PLL */
+	usleep_range(atusb->data->t_channel_switch,
+			atusb->data->t_channel_switch + 10);
+	
+	return 0;
+}
 
+static int atusb_set_channel(struct atusb *atusb, u8 page, u8 channel) {
+	int ret;
+	
 	ret = atusb_write_subreg(atusb, SR_CHANNEL, channel);
 	if (ret < 0)
 		return ret;
-	msleep(1);	/* @@@ ugly synchronization */
 	return 0;
+}
+
+static inline int
+hulusb_update_cca_ed_level(struct atusb *lp, int rssi_base_val)
+{
+	unsigned int cca_ed_thres;
+	
+	cca_ed_thres = atusb_read_subreg(lp, SR_CCA_ED_THRES);
+	
+	switch (rssi_base_val) {
+		case -98:
+			lp->hw->phy->supported.cca_ed_levels = at86rf212_ed_levels_98;
+			lp->hw->phy->supported.cca_ed_levels_size = ARRAY_SIZE(at86rf212_ed_levels_98);
+			lp->hw->phy->cca_ed_level = at86rf212_ed_levels_98[cca_ed_thres];
+			break;
+		case -100:
+			lp->hw->phy->supported.cca_ed_levels = at86rf212_ed_levels_100;
+			lp->hw->phy->supported.cca_ed_levels_size = ARRAY_SIZE(at86rf212_ed_levels_100);
+			lp->hw->phy->cca_ed_level = at86rf212_ed_levels_100[cca_ed_thres];
+			break;
+		default:
+			WARN_ON(1);
+	}
+	
+	return 0;
+}
+
+static int
+hulusb_set_channel(struct atusb *atusb, u8 page, u8 channel)
+{
+	int rc;
+	int rssi_base_val;
+	
+	if (channel == 0)
+		rc = atusb_write_subreg(atusb, SR_SUB_MODE, 0);
+	else
+		rc = atusb_write_subreg(atusb, SR_SUB_MODE, 1);
+	if (rc < 0)
+		return rc;
+	
+	if (page == 0) {
+		rc = atusb_write_subreg(atusb, SR_BPSK_QPSK, 0);
+		rssi_base_val = -100;
+	} else {
+		rc = atusb_write_subreg(atusb, SR_BPSK_QPSK, 1);
+		rssi_base_val = -98;
+	}
+	if (rc < 0)
+		return rc;
+	
+	rc = hulusb_update_cca_ed_level(atusb, rssi_base_val);
+	if (rc < 0)
+		return rc;
+	
+	/* This sets the symbol_duration according frequency on the 212.
+	 * TODO move this handling while set channel and page in cfg802154.
+	 * We can do that, this timings are according 802.15.4 standard.
+	 * If we do that in cfg802154, this is a more generic calculation.
+	 *
+	 * This should also protected from ifs_timer. Means cancel timer and
+	 * init with a new value. For now, this is okay.
+	 */
+	if (channel == 0) {
+		if (page == 0) {
+			/* SUB:0 and BPSK:0 -> BPSK-20 */
+			atusb->hw->phy->symbol_duration = 50;
+		} else {
+			/* SUB:1 and BPSK:0 -> BPSK-40 */
+			atusb->hw->phy->symbol_duration = 25;
+		}
+	} else {
+		if (page == 0)
+			/* SUB:0 and BPSK:1 -> OQPSK-100/200/400 */
+			atusb->hw->phy->symbol_duration = 40;
+		else
+			/* SUB:1 and BPSK:1 -> OQPSK-250/500/1000 */
+			atusb->hw->phy->symbol_duration = 16;
+	}
+	
+	atusb->hw->phy->lifs_period = IEEE802154_LIFS_PERIOD *
+	atusb->hw->phy->symbol_duration;
+	atusb->hw->phy->sifs_period = IEEE802154_SIFS_PERIOD *
+	atusb->hw->phy->symbol_duration;
+	
+	return atusb_write_subreg(atusb, SR_CHANNEL, channel);
 }
 
 static int atusb_ed(struct ieee802154_hw *hw, u8 *level)
@@ -483,13 +614,33 @@ static const s32 atusb_powers[ATUSB_MAX_TX_POWERS + 1] = {
 };
 
 static int
-atusb_set_txpower(struct ieee802154_hw *hw, s32 mbm)
+hulusb_set_txpower(struct atusb *atusb, s32 mbm)
+{
+	u32 i;
+	
+	for (i = 0; i < atusb->hw->phy->supported.tx_powers_size; i++) {
+		if (atusb->hw->phy->supported.tx_powers[i] == mbm)
+			return atusb_write_subreg(atusb, SR_TX_PWR_212, i);
+	}
+	
+	return -EINVAL;
+}
+
+static int
+atusb_default_set_txpower(struct ieee802154_hw *hw, s32 mbm)
 {
 	struct atusb *atusb = hw->priv;
+	
+	return atusb->data->set_txpower(atusb, mbm);
+}
+
+static int
+atusb_set_txpower(struct atusb *atusb, s32 mbm)
+{
 	u32 i;
 
-	for (i = 0; i < hw->phy->supported.tx_powers_size; i++) {
-		if (hw->phy->supported.tx_powers[i] == mbm)
+	for (i = 0; i < atusb->hw->phy->supported.tx_powers_size; i++) {
+		if (atusb->hw->phy->supported.tx_powers[i] == mbm)
 			return atusb_write_subreg(atusb, SR_TX_PWR_23X, i);
 	}
 
@@ -504,27 +655,18 @@ atusb_set_lbt(struct ieee802154_hw *hw, bool on)
     return atusb_write_subreg(atusb, SR_CSMA_LBT_MODE, on);
 }
 
-#define AT86RF212_MAX_TX_POWERS 0x1F
-static const s32 at86rf212_powers[AT86RF212_MAX_TX_POWERS + 1] = {
-	500, 400, 300, 200, 100, 0, -100, -200, -300, -400, -500, -600, -700,
-	-800, -900, -1000, -1100, -1200, -1300, -1400, -1500, -1600, -1700,
-	-1800, -1900, -2000, -2100, -2200, -2300, -2400, -2500, -2600,
+struct atusb_chip_data atrzusb_chip_data = {
+	.t_channel_switch = 24,
+	.rssi_base_val = -91,
+	.set_txpower = atusb_set_txpower,
+	.set_channel = atusb_set_channel,
 };
 
-#define ATUSB_MAX_ED_LEVELS 0xF
-static const s32 atusb_ed_levels[ATUSB_MAX_ED_LEVELS + 1] = {
-	-9100, -8900, -8700, -8500, -8300, -8100, -7900, -7700, -7500, -7300,
-	-7100, -6900, -6700, -6500, -6300, -6100,
-};
-
-static const s32 at86rf212_ed_levels_100[ATUSB_MAX_ED_LEVELS + 1] = {
-	-10000, -9800, -9600, -9400, -9200, -9000, -8800, -8600, -8400, -8200,
-	-8000, -7800, -7600, -7400, -7200, -7000,
-};
-
-static const s32 at86rf212_ed_levels_98[ATUSB_MAX_ED_LEVELS + 1] = {
-	-9800, -9600, -9400, -9200, -9000, -8800, -8600, -8400, -8200, -8000,
-	-7800, -7600, -7400, -7200, -7000, -6800,
+struct atusb_chip_data hulusb_chip_data = {
+	.t_channel_switch = 11,
+	.rssi_base_val = -100,
+	.set_txpower = hulusb_set_txpower,
+	.set_channel = hulusb_set_channel,
 };
 
 static int
@@ -626,102 +768,15 @@ atusb_set_frame_retries(struct ieee802154_hw *hw, s8 retries)
     return atusb_write_subreg(atusb, SR_MAX_FRAME_RETRIES, retries);
 }
 
-static inline int
-atusbrf212_update_cca_ed_level(struct atusb *lp, int rssi_base_val)
-{
-	unsigned int cca_ed_thres;
-	
-	cca_ed_thres = atusb_read_subreg(lp, SR_CCA_ED_THRES);
-	
-	switch (rssi_base_val) {
-		case -98:
-			lp->hw->phy->supported.cca_ed_levels = at86rf212_ed_levels_98;
-			lp->hw->phy->supported.cca_ed_levels_size = ARRAY_SIZE(at86rf212_ed_levels_98);
-			lp->hw->phy->cca_ed_level = at86rf212_ed_levels_98[cca_ed_thres];
-			break;
-		case -100:
-			lp->hw->phy->supported.cca_ed_levels = at86rf212_ed_levels_100;
-			lp->hw->phy->supported.cca_ed_levels_size = ARRAY_SIZE(at86rf212_ed_levels_100);
-			lp->hw->phy->cca_ed_level = at86rf212_ed_levels_100[cca_ed_thres];
-			break;
-		default:
-			WARN_ON(1);
-	}
-	
-	return 0;
-}
-
-static int
-atusbrf212_set_channel(struct ieee802154_hw *hw, u8 page, u8 channel)
-{
-	int rc;
-	int rssi_base_val;
-	
-	struct atusb *lp = hw->priv;
-	
-	if (channel == 0)
-		rc = atusb_write_subreg(lp, SR_SUB_MODE, 0);
-	else
-		rc = atusb_write_subreg(lp, SR_SUB_MODE, 1);
-	if (rc < 0)
-		return rc;
-	
-	if (page == 0) {
-		rc = atusb_write_subreg(lp, SR_BPSK_QPSK, 0);
-		rssi_base_val = -100;
-	} else {
-		rc = atusb_write_subreg(lp, SR_BPSK_QPSK, 1);
-		rssi_base_val = -98;
-	}
-	if (rc < 0)
-		return rc;
-	
-	rc = atusbrf212_update_cca_ed_level(lp, rssi_base_val);
-	if (rc < 0)
-		return rc;
-	
-	/* This sets the symbol_duration according frequency on the 212.
-	 * TODO move this handling while set channel and page in cfg802154.
-	 * We can do that, this timings are according 802.15.4 standard.
-	 * If we do that in cfg802154, this is a more generic calculation.
-	 *
-	 * This should also protected from ifs_timer. Means cancel timer and
-	 * init with a new value. For now, this is okay.
-	 */
-	if (channel == 0) {
-		if (page == 0) {
-			/* SUB:0 and BPSK:0 -> BPSK-20 */
-			lp->hw->phy->symbol_duration = 50;
-		} else {
-			/* SUB:1 and BPSK:0 -> BPSK-40 */
-			lp->hw->phy->symbol_duration = 25;
-		}
-	} else {
-		if (page == 0)
-			/* SUB:0 and BPSK:1 -> OQPSK-100/200/400 */
-			lp->hw->phy->symbol_duration = 40;
-		else
-			/* SUB:1 and BPSK:1 -> OQPSK-250/500/1000 */
-			lp->hw->phy->symbol_duration = 16;
-	}
-	
-	lp->hw->phy->lifs_period = IEEE802154_LIFS_PERIOD *
-	lp->hw->phy->symbol_duration;
-	lp->hw->phy->sifs_period = IEEE802154_SIFS_PERIOD *
-	lp->hw->phy->symbol_duration;
-	
-	return atusb_write_subreg(lp, SR_CHANNEL, channel);
-}
-
 static struct ieee802154_ops atusb_ops = {
 	.owner			= THIS_MODULE,
 	.xmit_async		= atusb_xmit,
 	.ed			= atusb_ed,
-	.set_channel		= atusbrf212_set_channel,
+	.set_channel		= atusb_default_channel,
 	.start			= atusb_start,
 	.stop			= atusb_stop,
 	.set_hw_addr_filt	= atusb_set_hw_addr_filt,
-	.set_txpower		= atusb_set_txpower,
+	.set_txpower		= atusb_default_set_txpower,
     .set_lbt = atusb_set_lbt,
 	.set_cca_mode		= atusb_set_cca_mode,
 	.set_cca_ed_level	= atusb_set_cca_ed_level,
@@ -736,6 +791,7 @@ static int atusb_get_and_show_revision(struct atusb *atusb)
 {
 	struct usb_device *usb_dev = atusb->usb_dev;
 	unsigned char *buffer;
+	const char* hw_name;
 	int ret;
 
 	buffer = kmalloc(3, GFP_KERNEL);
@@ -746,10 +802,32 @@ static int atusb_get_and_show_revision(struct atusb *atusb)
 	ret = atusb_control_msg(atusb, usb_rcvctrlpipe(usb_dev, 0),
 				ATUSB_ID, ATUSB_REQ_FROM_DEV, 0, 0,
 				buffer, 3, 1000);
-	if (ret >= 0)
+	if (ret >= 0) {
+		
+		uint8_t hw_type = buffer[2];
+		switch (hw_type) {
+			case ATUSB_HW_TYPE_100813:
+			case ATUSB_HW_TYPE_101216:
+			case ATUSB_HW_TYPE_110131:
+			case ATUSB_HW_TYPE_RZUSB:
+				hw_name = "ATUSB";
+				atusb->data = &atrzusb_chip_data;
+				break;
+			case ATUSB_HW_TYPE_HULUSB:
+				hw_name = "HULUSB";
+				atusb->data = &hulusb_chip_data;
+				break;
+			default:
+				hw_name = "Unknown";
+				ret = -ENOTSUPP;
+				break;
+		}
+		
 		dev_info(&usb_dev->dev,
-			 "Firmware: major: %u, minor: %u, hardware type: %u\n",
-			 buffer[0], buffer[1], buffer[2]);
+				 "Firmware: major: %u, minor: %u, hardware type: %s\n",
+		   buffer[0], buffer[1], hw_name);
+		
+	}
 	if (buffer[0] == 0 && buffer[1] < 2) {
 		dev_info(&usb_dev->dev,
 			 "Firmware version (%u.%u) is predates our first public release.",
