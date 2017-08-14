@@ -809,8 +809,11 @@ static int atusb_get_and_show_revision(struct atusb *atusb)
 			case ATUSB_HW_TYPE_100813:
 			case ATUSB_HW_TYPE_101216:
 			case ATUSB_HW_TYPE_110131:
-			case ATUSB_HW_TYPE_RZUSB:
 				hw_name = "ATUSB";
+				atusb->data = &atrzusb_chip_data;
+				break;
+			case ATUSB_HW_TYPE_RZUSB:
+				hw_name = "RZUSB";
 				atusb->data = &atrzusb_chip_data;
 				break;
 			case ATUSB_HW_TYPE_HULUSB:
