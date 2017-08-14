@@ -134,6 +134,19 @@ static int atusb_read_reg(struct atusb *atusb, uint8_t reg)
 	}
 }
 
+static inline int
+atusb_read_subreg(struct atusb *lp,
+					  unsigned int addr, unsigned int mask,
+					  unsigned int shift)
+{
+	int rc;
+	
+	rc = atusb_read_reg(lp, addr);
+	rc = (rc & mask) >> shift;
+	
+	return rc;
+}
+
 static int atusb_write_subreg(struct atusb *atusb, uint8_t reg, uint8_t mask,
 			      uint8_t shift, uint8_t value)
 {
@@ -491,10 +504,27 @@ atusb_set_lbt(struct ieee802154_hw *hw, bool on)
     return atusb_write_subreg(atusb, SR_CSMA_LBT_MODE, on);
 }
 
+#define AT86RF212_MAX_TX_POWERS 0x1F
+static const s32 at86rf212_powers[AT86RF212_MAX_TX_POWERS + 1] = {
+	500, 400, 300, 200, 100, 0, -100, -200, -300, -400, -500, -600, -700,
+	-800, -900, -1000, -1100, -1200, -1300, -1400, -1500, -1600, -1700,
+	-1800, -1900, -2000, -2100, -2200, -2300, -2400, -2500, -2600,
+};
+
 #define ATUSB_MAX_ED_LEVELS 0xF
 static const s32 atusb_ed_levels[ATUSB_MAX_ED_LEVELS + 1] = {
 	-9100, -8900, -8700, -8500, -8300, -8100, -7900, -7700, -7500, -7300,
 	-7100, -6900, -6700, -6500, -6300, -6100,
+};
+
+static const s32 at86rf212_ed_levels_100[ATUSB_MAX_ED_LEVELS + 1] = {
+	-10000, -9800, -9600, -9400, -9200, -9000, -8800, -8600, -8400, -8200,
+	-8000, -7800, -7600, -7400, -7200, -7000,
+};
+
+static const s32 at86rf212_ed_levels_98[ATUSB_MAX_ED_LEVELS + 1] = {
+	-9800, -9600, -9400, -9200, -9000, -8800, -8600, -8400, -8200, -8000,
+	-7800, -7600, -7400, -7200, -7000, -6800,
 };
 
 static int
@@ -596,11 +626,98 @@ atusb_set_frame_retries(struct ieee802154_hw *hw, s8 retries)
     return atusb_write_subreg(atusb, SR_MAX_FRAME_RETRIES, retries);
 }
 
+static inline int
+atusbrf212_update_cca_ed_level(struct atusb *lp, int rssi_base_val)
+{
+	unsigned int cca_ed_thres;
+	
+	cca_ed_thres = atusb_read_subreg(lp, SR_CCA_ED_THRES);
+	
+	switch (rssi_base_val) {
+		case -98:
+			lp->hw->phy->supported.cca_ed_levels = at86rf212_ed_levels_98;
+			lp->hw->phy->supported.cca_ed_levels_size = ARRAY_SIZE(at86rf212_ed_levels_98);
+			lp->hw->phy->cca_ed_level = at86rf212_ed_levels_98[cca_ed_thres];
+			break;
+		case -100:
+			lp->hw->phy->supported.cca_ed_levels = at86rf212_ed_levels_100;
+			lp->hw->phy->supported.cca_ed_levels_size = ARRAY_SIZE(at86rf212_ed_levels_100);
+			lp->hw->phy->cca_ed_level = at86rf212_ed_levels_100[cca_ed_thres];
+			break;
+		default:
+			WARN_ON(1);
+	}
+	
+	return 0;
+}
+
+static int
+atusbrf212_set_channel(struct ieee802154_hw *hw, u8 page, u8 channel)
+{
+	int rc;
+	int rssi_base_val;
+	
+	struct atusb *lp = hw->priv;
+	
+	if (channel == 0)
+		rc = atusb_write_subreg(lp, SR_SUB_MODE, 0);
+	else
+		rc = atusb_write_subreg(lp, SR_SUB_MODE, 1);
+	if (rc < 0)
+		return rc;
+	
+	if (page == 0) {
+		rc = atusb_write_subreg(lp, SR_BPSK_QPSK, 0);
+		rssi_base_val = -100;
+	} else {
+		rc = atusb_write_subreg(lp, SR_BPSK_QPSK, 1);
+		rssi_base_val = -98;
+	}
+	if (rc < 0)
+		return rc;
+	
+	rc = atusbrf212_update_cca_ed_level(lp, rssi_base_val);
+	if (rc < 0)
+		return rc;
+	
+	/* This sets the symbol_duration according frequency on the 212.
+	 * TODO move this handling while set channel and page in cfg802154.
+	 * We can do that, this timings are according 802.15.4 standard.
+	 * If we do that in cfg802154, this is a more generic calculation.
+	 *
+	 * This should also protected from ifs_timer. Means cancel timer and
+	 * init with a new value. For now, this is okay.
+	 */
+	if (channel == 0) {
+		if (page == 0) {
+			/* SUB:0 and BPSK:0 -> BPSK-20 */
+			lp->hw->phy->symbol_duration = 50;
+		} else {
+			/* SUB:1 and BPSK:0 -> BPSK-40 */
+			lp->hw->phy->symbol_duration = 25;
+		}
+	} else {
+		if (page == 0)
+			/* SUB:0 and BPSK:1 -> OQPSK-100/200/400 */
+			lp->hw->phy->symbol_duration = 40;
+		else
+			/* SUB:1 and BPSK:1 -> OQPSK-250/500/1000 */
+			lp->hw->phy->symbol_duration = 16;
+	}
+	
+	lp->hw->phy->lifs_period = IEEE802154_LIFS_PERIOD *
+	lp->hw->phy->symbol_duration;
+	lp->hw->phy->sifs_period = IEEE802154_SIFS_PERIOD *
+	lp->hw->phy->symbol_duration;
+	
+	return atusb_write_subreg(lp, SR_CHANNEL, channel);
+}
+
 static struct ieee802154_ops atusb_ops = {
 	.owner			= THIS_MODULE,
 	.xmit_async		= atusb_xmit,
 	.ed			= atusb_ed,
-	.set_channel		= atusb_channel,
+	.set_channel		= atusbrf212_set_channel,
 	.start			= atusb_start,
 	.stop			= atusb_stop,
 	.set_hw_addr_filt	= atusb_set_hw_addr_filt,
@@ -666,19 +783,6 @@ static int atusb_get_and_show_build(struct atusb *atusb)
 	return ret;
 }
 
-#define AT86RF212_MAX_TX_POWERS 0x1F
-static const s32 at86rf212_powers[AT86RF212_MAX_TX_POWERS + 1] = {
-    500, 400, 300, 200, 100, 0, -100, -200, -300, -400, -500, -600, -700,
-    -800, -900, -1000, -1100, -1200, -1300, -1400, -1500, -1600, -1700,
-    -1800, -1900, -2000, -2100, -2200, -2300, -2400, -2500, -2600,
-};
-
-#define AT86RF2XX_MAX_ED_LEVELS 0xF
-static const s32 at86rf212_ed_levels_100[AT86RF2XX_MAX_ED_LEVELS + 1] = {
-    -10000, -9800, -9600, -9400, -9200, -9000, -8800, -8600, -8400, -8200,
-    -8000, -7800, -7600, -7400, -7200, -7000,
-};
-
 static int atusb_get_and_show_chip(struct atusb *atusb)
 {
 	struct usb_device *usb_dev = atusb->usb_dev;
@@ -711,9 +815,6 @@ static int atusb_get_and_show_chip(struct atusb *atusb)
     atusb->hw->phy->supported.cca_opts = BIT(NL802154_CCA_OPT_ENERGY_CARRIER_AND) |
     BIT(NL802154_CCA_OPT_ENERGY_CARRIER_OR);
     
-    atusb->hw->phy->supported.cca_ed_levels = atusb_ed_levels;
-    atusb->hw->phy->supported.cca_ed_levels_size = ARRAY_SIZE(atusb_ed_levels);
-    
     atusb->hw->phy->cca.mode = NL802154_CCA_ENERGY;
     
     atusb->hw->phy->current_page = 0;
@@ -724,6 +825,8 @@ static int atusb_get_and_show_chip(struct atusb *atusb)
         atusb->hw->phy->supported.channels[0] = 0x7FFF800;
         atusb->hw->phy->current_channel = 11;	/* reset default */
         atusb->hw->phy->symbol_duration = 16;
+		atusb->hw->phy->supported.cca_ed_levels = atusb_ed_levels;
+		atusb->hw->phy->supported.cca_ed_levels_size = ARRAY_SIZE(atusb_ed_levels);
         atusb->hw->phy->supported.tx_powers = atusb_powers;
         atusb->hw->phy->supported.tx_powers_size = ARRAY_SIZE(atusb_powers);
 		break;
@@ -732,6 +835,8 @@ static int atusb_get_and_show_chip(struct atusb *atusb)
         atusb->hw->phy->supported.channels[0] = 0x7FFF800;
         atusb->hw->phy->current_channel = 11;	/* reset default */
         atusb->hw->phy->symbol_duration = 16;
+		atusb->hw->phy->supported.cca_ed_levels = atusb_ed_levels;
+		atusb->hw->phy->supported.cca_ed_levels_size = ARRAY_SIZE(atusb_ed_levels);
         atusb->hw->phy->supported.tx_powers = atusb_powers;
         atusb->hw->phy->supported.tx_powers_size = ARRAY_SIZE(atusb_powers);
 		break;

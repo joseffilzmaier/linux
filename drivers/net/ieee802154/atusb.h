@@ -48,6 +48,14 @@ enum atusb_requests {
 	ATUSB_TX,
 };
 
+enum atusb_hardwaretype {
+	ATUSB_HW_TYPE_100813,
+	ATUSB_HW_TYPE_101216,
+	ATUSB_HW_TYPE_110131,
+	ATUSB_HW_TYPE_RZUSB,
+	ATUSB_HW_TYPE_HULUSB,
+};
+
 /* Direction	bRequest		wValue		wIndex	wLength
  *
  * ->host	ATUSB_ID		-		-	3
